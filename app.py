@@ -129,6 +129,20 @@ FLAGS_INFO = {
             "sea necesario y puedes eliminarlo o dejarlo como está."
         ),
     },
+    "P_S3A": {
+        "titulo": "Escritura/lectura directa a bucket S3 externo (`s3a://`)",
+        "requiere_accion": False,
+        "instruccion": (
+            "Este notebook accede directamente a un bucket S3 usando el protocolo `s3a://`. "
+            "Estas rutas no pasan por los montajes estándar `/mnt/` y no fueron modificadas automáticamente.\n\n"
+            "**Qué verificar antes de ejecutar en el nuevo workspace:**\n"
+            "Confirma con Agustín que el nuevo workspace tiene acceso a ese bucket. "
+            "En Unity Catalog el acceso a S3 externo requiere una **External Location** configurada "
+            "por el administrador — no basta con el instance profile del workspace viejo.\n\n"
+            "Si el bucket no tiene External Location configurada, el notebook fallará al intentar "
+            "leer o escribir aunque el resto del código esté correcto."
+        ),
+    },
 }
 
 
@@ -188,19 +202,57 @@ def insertar_use_catalog(nb: dict) -> tuple:
 
 
 def agregar_widget_catalog_source(nb: dict) -> tuple:
-    """Agrega widget catalog_source junto a database_source si no existe."""
+    """
+    Agrega widget catalog_source junto a database_source si no existe.
+    Retorna también las líneas con variables dinámicas que usan database_source
+    y que deben actualizarse manualmente en las consultas SQL.
+    """
     patron_widget = re.compile(
         r'(dbutils\.widgets\.(text|combobox|dropdown)\s*\(\s*["\']database_source["\'][^\n]*)',
         re.I
     )
     patron_ya_tiene = re.compile(r'catalog_source', re.I)
-    texto_completo = texto_completo_notebook(nb)
+    texto_nb = texto_completo_notebook(nb)
 
-    if not patron_widget.search(texto_completo):
-        return False, None
-    if patron_ya_tiene.search(texto_completo):
-        return False, "ya tenía catalog_source"
+    if not patron_widget.search(texto_nb):
+        return False, None, []
+    if patron_ya_tiene.search(texto_nb):
+        return False, "ya tenía catalog_source", []
 
+    # Extraer nombre de la variable que recibe database_source
+    # Ejemplo: database = dbutils.widgets.get("database_source") -> variable = "database"
+    patron_get = re.compile(
+        r'(\w+)\s*=\s*dbutils\.widgets\.get\s*\(\s*["\']database_source["\']\s*\)',
+        re.I
+    )
+    variables_db = set()
+    for cell in nb.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+        src = source_to_text(cell.get("source", []))
+        for m in patron_get.finditer(src):
+            variables_db.add(m.group(1))
+
+    # Detectar líneas con consultas que usan esas variables dinámicamente
+    lineas_dinamicas = []
+    if variables_db:
+        patron_dinamico = re.compile(
+            r'\{(' + '|'.join(re.escape(v) for v in variables_db) + r')\}',
+            re.I
+        )
+        for num_celda, cell in enumerate(nb.get("cells", []), start=1):
+            if cell.get("cell_type") != "code":
+                continue
+            src = source_to_text(cell.get("source", []))
+            for num_linea, linea in enumerate(src.split("\n"), start=1):
+                if patron_dinamico.search(linea) and linea.strip() and not linea.strip().startswith("#"):
+                    lineas_dinamicas.append({
+                        "celda": num_celda,
+                        "linea": num_linea,
+                        "codigo": linea.strip(),
+                    })
+
+    # Agregar widget catalog_source
     insertados = 0
     for cell in nb.get("cells", []):
         if cell.get("cell_type") != "code":
@@ -208,7 +260,6 @@ def agregar_widget_catalog_source(nb: dict) -> tuple:
         src = source_to_text(cell.get("source", []))
         if not patron_widget.search(src):
             continue
-
         lineas = src.split("\n")
         nuevas = []
         for linea in lineas:
@@ -216,15 +267,12 @@ def agregar_widget_catalog_source(nb: dict) -> tuple:
             m = patron_widget.search(linea)
             if m:
                 indent = len(linea) - len(linea.lstrip())
-                es_bloque = indent > 0
-                if not es_bloque:
-                    nuevas.append(
-                        'dbutils.widgets.text("catalog_source", "regional")'
-                    )
+                if indent == 0:
+                    nuevas.append('dbutils.widgets.text("catalog_source", "regional")')
                     insertados += 1
         set_cell_source(cell, "\n".join(nuevas))
 
-    return insertados > 0, f"widget `catalog_source` agregado automáticamente."
+    return insertados > 0, "widget `catalog_source` agregado automáticamente.", lineas_dinamicas
 
 
 def limpiar_hms(nb: dict) -> tuple:
@@ -309,6 +357,7 @@ PATRONES_FLAGS = {
         r'\{(\w*(?:database|schema|db)\w*)\}\s*\.\s*\{(\w*(?:table|tabla)\w*)\}', re.I
     ),
     "P99": re.compile(r'''["']hive_metastore\.["']''', re.I),
+    "P_S3A": re.compile(r's3a?://(?!s3-marathon-bronze|s3-marathon-silver|s3-marathon-gold)([a-zA-Z0-9_\-]+)/', re.I),
 }
 
 
@@ -391,7 +440,7 @@ def procesar_notebook(nombre: str, contenido_bytes: bytes) -> dict:
 
     # Aplicar transformaciones
     uc_insertado, uc_msg           = insertar_use_catalog(nb_trabajo)
-    p9_insertado, p9_msg           = agregar_widget_catalog_source(nb_trabajo)
+    p9_insertado, p9_msg, p9_lineas_dinamicas = agregar_widget_catalog_source(nb_trabajo)
     hms_eliminados, cambios_hms    = limpiar_hms(nb_trabajo)
     mnt_reemplazados, cambios_mnt  = reemplazar_mnt(nb_trabajo)
 
@@ -412,6 +461,7 @@ def procesar_notebook(nombre: str, contenido_bytes: bytes) -> dict:
             "uc_msg": uc_msg,
             "p9_insertado": p9_insertado,
             "p9_msg": p9_msg,
+            "p9_lineas_dinamicas": p9_lineas_dinamicas,
             "hms_count": hms_count,
             "hms_eliminados": hms_eliminados,
             "cambios_hms": cambios_hms,
@@ -468,6 +518,21 @@ def render_resultado(r: dict):
 
         if c["p9_insertado"]:
             st.markdown("- 🟢 Widget `catalog_source` agregado automáticamente junto a `database_source`.")
+            if c.get("p9_lineas_dinamicas"):
+                st.warning(
+                    f"⚠️ Se detectaron **{len(c['p9_lineas_dinamicas'])} consulta(s)** que usan la variable "
+                    f"`database_source` dinámicamente y deben actualizarse a mano."
+                )
+                with st.expander("Ver líneas que requieren actualización manual"):
+                    st.markdown(
+                        "Estas líneas construyen consultas con `{database}` o similar. "
+                        "Deben incluir el catálogo: `{catalog}.{database}.tabla`"
+                    )
+                    for ld in c["p9_lineas_dinamicas"]:
+                        st.code(
+                            f"Celda {ld['celda']}, línea {ld['linea']}:\n  {ld['codigo']}",
+                            language="python"
+                        )
 
         if c["cambios_hms"]:
             with st.expander(f"Ver {len(c['cambios_hms'])} cambios de hive_metastore."):
@@ -594,7 +659,7 @@ def generar_reporte_md(r: dict) -> str:
         f"| Cambio | Resultado |",
         f"|--------|-----------|",
         f"| `USE CATALOG regional` | {'✅ Insertado al inicio del notebook' if c['uc_insertado'] else f'ℹ️ {c["uc_msg"]}'} |",
-        f"| Widget `catalog_source` | {'✅ Agregado automáticamente' if c['p9_insertado'] else 'No aplica'} |",
+        f"| Widget `catalog_source` | {'✅ Agregado + consultas detectadas' if c.get('p9_lineas_dinamicas') else ('✅ Agregado' if c['p9_insertado'] else 'No aplica')} |",
         f"| `hive_metastore.` eliminados | {c['hms_eliminados']} de {c['hms_count']} encontrados |",
         f"| Rutas `/mnt/` reemplazadas | {c['mnt_reemplazados']} de {c['mnt_count']} encontradas |",
         "",
@@ -623,6 +688,36 @@ def generar_reporte_md(r: dict) -> str:
                 "```",
                 "",
             ]
+
+    if c.get("p9_lineas_dinamicas"):
+        n_ld = len(c["p9_lineas_dinamicas"])
+        lines += [
+            f"### ⚠️ Consultas con variable dinámica — requieren actualización manual ({n_ld})",
+            "",
+            "> El script agregó `catalog_source` automáticamente, pero estas líneas",
+            "> construyen consultas usando la variable de base de datos dinámicamente.",
+            "> Deben actualizarse manualmente para incluir el catálogo.",
+            "",
+            "**Cómo corregirlas:**",
+            "```python",
+            "# ANTES",
+            "spark.sql(f\"SELECT * FROM {database}.tabla\")",
+            "# DESPUÉS",
+            "spark.sql(f\"SELECT * FROM {catalog}.{database}.tabla\")",
+            "```",
+            "",
+            "**Líneas afectadas:**",
+            "",
+        ]
+        for ld in c["p9_lineas_dinamicas"]:
+            lines += [
+                f"**Celda {ld['celda']}, línea {ld['linea']}:**",
+                "```python",
+                f"  {ld['codigo']}",
+                "```",
+                "",
+            ]
+
 
     # ── Flags que requieren acción ────────────────────────────────
     flags_accion = {k: v for k, v in r["flags"].items() if FLAGS_INFO.get(k, {}).get("requiere_accion")}
