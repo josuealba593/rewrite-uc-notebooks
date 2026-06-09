@@ -537,87 +537,152 @@ def generar_zip(resultados: list) -> bytes:
                 zf.writestr(f"corregidos/{nombre_corr}", r["bytes_corregido"])
 
             # Reporte txt
-            reporte = generar_reporte_txt(r)
-            zf.writestr(f"reportes/reporte_{stem}.txt", reporte)
+            reporte = generar_reporte_md(r)
+            zf.writestr(f"reportes/reporte_{stem}.md", reporte)
 
     buf.seek(0)
     return buf.read()
 
 
-def generar_reporte_txt(r: dict) -> str:
-    sep = "=" * 60
+def generar_reporte_md(r: dict) -> str:
+    """Genera reporte en formato Markdown — legible y descargable."""
+    fecha = datetime.now().strftime("%Y-%m-%d %H:%M")
+    nombre = r["nombre_original"]
     lines = [
-        sep,
-        f"REPORTE REWRITE UC — {r['nombre_original']}",
-        f"Fecha: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"Estado: {r['estado'].upper()}",
-        sep, "",
+        f"# Reporte Rewrite UC — `{nombre}`",
+        f"**Fecha:** {fecha}  ",
+        "",
     ]
 
+    # ── Estado principal ──────────────────────────────────────────
     if r["estado"] == "error":
-        lines += ["ERROR:", r["error_msg"], ""]
+        lines += [
+            "## ❌ No se pudo procesar",
+            "",
+            f"> {r['error_msg']}",
+            "",
+            "---",
+            "Asegúrate de exportar el notebook como **IPython Notebook (.ipynb)** desde",
+            "**File → Export** en Databricks, no como DBC Archive.",
+        ]
         return "\n".join(lines)
 
+    if r["estado"] == "ok":
+        lines += [
+            "## ✅ Procesado correctamente",
+            "",
+            "> No se requiere ninguna acción adicional.",
+            "> Descarga el archivo corregido y súbelo al nuevo workspace.",
+            "",
+        ]
+    else:
+        lines += [
+            "## ⚠️ Procesado con observaciones",
+            "",
+            "> El archivo fue corregido automáticamente, pero hay puntos que requieren",
+            "> revisión manual **antes de subirlo al nuevo workspace**.",
+            "> Revisa la sección de intervención humana más abajo.",
+            "",
+        ]
+
+    # ── Cambios automáticos ───────────────────────────────────────
     c = r["cambios"]
     lines += [
-        "── CAMBIOS AUTOMÁTICOS ──────────────────────────────────", "",
-        f"USE CATALOG regional: {'INSERTADO' if c['uc_insertado'] else c['uc_msg']}",
-        f"Widget catalog_source: {'AGREGADO' if c['p9_insertado'] else 'no aplica'}",
-        f"hive_metastore. encontrados: {c['hms_count']} | eliminados: {c['hms_eliminados']}",
-        f"/mnt/ encontrados: {c['mnt_count']} | reemplazados: {c['mnt_reemplazados']}",
+        "---",
+        "## ✅ Cambios aplicados automáticamente",
+        "",
+        f"| Cambio | Resultado |",
+        f"|--------|-----------|",
+        f"| `USE CATALOG regional` | {'✅ Insertado al inicio del notebook' if c['uc_insertado'] else f'ℹ️ {c["uc_msg"]}'} |",
+        f"| Widget `catalog_source` | {'✅ Agregado automáticamente' if c['p9_insertado'] else 'No aplica'} |",
+        f"| `hive_metastore.` eliminados | {c['hms_eliminados']} de {c['hms_count']} encontrados |",
+        f"| Rutas `/mnt/` reemplazadas | {c['mnt_reemplazados']} de {c['mnt_count']} encontradas |",
         "",
     ]
 
     if c["cambios_hms"]:
-        lines.append("Detalle hive_metastore. eliminados:")
+        lines += [f"### Detalle — `hive_metastore.` eliminados ({len(c['cambios_hms'])})", ""]
         for ch in c["cambios_hms"]:
             lines += [
-                f"  Celda {ch['celda']}, línea {ch['linea']}:",
-                f"    ANTES:   {ch['antes']}",
-                f"    DESPUÉS: {ch['despues']}",
+                f"**Celda {ch['celda']}, línea {ch['linea']}**",
+                "```diff",
+                f"- {ch['antes']}",
+                f"+ {ch['despues']}",
+                "```",
+                "",
             ]
-        lines.append("")
 
     if c["cambios_mnt"]:
-        lines.append("Detalle /mnt/ reemplazados:")
+        lines += [f"### Detalle — rutas `/mnt/` reemplazadas ({len(c['cambios_mnt'])})", ""]
         for cm in c["cambios_mnt"]:
             lines += [
-                f"  Celda {cm['celda']}, línea {cm['linea']}:",
-                f"    ANTES:   {cm['antes']}",
-                f"    DESPUÉS: {cm['despues']}",
+                f"**Celda {cm['celda']}, línea {cm['linea']}**",
+                "```diff",
+                f"- {cm['antes']}",
+                f"+ {cm['despues']}",
+                "```",
+                "",
             ]
-        lines.append("")
 
+    # ── Flags que requieren acción ────────────────────────────────
     flags_accion = {k: v for k, v in r["flags"].items() if FLAGS_INFO.get(k, {}).get("requiere_accion")}
     flags_info   = {k: v for k, v in r["flags"].items() if not FLAGS_INFO.get(k, {}).get("requiere_accion")}
 
     if flags_accion:
-        lines += ["── REQUIERE INTERVENCIÓN HUMANA ─────────────────────────", ""]
+        lines += [
+            "---",
+            "## ⚠️ Requiere intervención humana",
+            "",
+            "> Estos puntos **no pudieron corregirse automáticamente**.",
+            "> Deben resolverse manualmente antes de importar el notebook en el nuevo workspace.",
+            "",
+        ]
         for flag_id, ocurrencias in flags_accion.items():
             info = FLAGS_INFO[flag_id]
-            lines += [f"[{flag_id}] {info['titulo']}", ""]
-            # Limpiar markdown para texto plano
-            instruccion_plain = re.sub(r'\*\*|`|```.*?```', '', info["instruccion"], flags=re.S).strip()
-            lines += [instruccion_plain, "", f"Líneas afectadas:"]
+            lines += [
+                f"### [{flag_id}] {info['titulo']}",
+                "",
+                info["instruccion"],
+                "",
+                f"**Líneas afectadas ({len(ocurrencias)}):**",
+                "",
+            ]
             for oc in ocurrencias:
-                lines.append(f"  Celda {oc['celda']}, línea {oc['linea']}: {oc['codigo']}")
-            lines.append("")
-    else:
-        lines += ["── RESULTADO ────────────────────────────────────────────", "",
-                  "✅ No se requiere ninguna acción adicional.", ""]
+                lines += [
+                    f"- **Celda {oc['celda']}, línea {oc['linea']}:**",
+                    f"  ```python",
+                    f"  {oc['codigo']}",
+                    f"  ```",
+                    "",
+                ]
 
+    # ── Flags informativos ────────────────────────────────────────
     if flags_info:
-        lines += ["── OBSERVACIONES INFORMATIVAS (sin acción requerida) ────", ""]
+        lines += [
+            "---",
+            "## ℹ️ Observaciones informativas",
+            "",
+            "> Los siguientes puntos fueron detectados pero **no requieren ninguna acción**.",
+            "",
+        ]
         for flag_id, ocurrencias in flags_info.items():
             info = FLAGS_INFO[flag_id]
-            lines += [f"[{flag_id}] {info['titulo']}"]
+            lines += [
+                f"### [{flag_id}] {info['titulo']}",
+                "",
+                info["instruccion"],
+                "",
+                f"**Líneas detectadas ({len(ocurrencias)}):**",
+                "",
+            ]
             for oc in ocurrencias:
-                lines.append(f"  Celda {oc['celda']}, línea {oc['linea']}: {oc['codigo']}")
+                lines += [
+                    f"- **Celda {oc['celda']}, línea {oc['linea']}:** `{oc['codigo']}`",
+                ]
             lines.append("")
 
-    lines.append(sep)
+    lines += ["---", f"*Generado por Rewrite UC — Marathon / Superdeporte · {fecha}*"]
     return "\n".join(lines)
-
 
 # ═══════════════════════════════════════════════════════════════════
 # INTERFAZ STREAMLIT
@@ -716,49 +781,22 @@ def main():
 
     st.markdown("### Descargar archivos")
 
-    if len(procesados) == 1:
-        r = procesados[0]
-        stem = Path(r["nombre_original"]).stem
-        col_a, col_b = st.columns(2)
-
-        col_a.download_button(
-            label="⬇️ Descargar notebook corregido",
-            data=r["bytes_corregido"],
-            file_name=r["nombre_original"],
-            mime="application/json",
-            use_container_width=True,
-            type="primary",
-        )
-        col_b.download_button(
-            label="⬇️ Descargar original (respaldo)",
-            data=r["bytes_original"],
-            file_name=f"{stem}(ORIG).ipynb",
-            mime="application/json",
-            use_container_width=True,
-        )
-        st.caption(
-            f"**{r['nombre_original']}** → importar en el nuevo workspace con este nombre.\n\n"
-            f"**{stem}(ORIG).ipynb** → copia de respaldo del notebook sin cambios."
-        )
-
-    else:
-        zip_bytes = generar_zip(procesados)
-        fecha = datetime.now().strftime("%Y%m%d_%H%M")
-        st.download_button(
-            label=f"⬇️ Descargar todos los archivos (.zip)",
-            data=zip_bytes,
-            file_name=f"notebooks_UC_{fecha}.zip",
-            mime="application/zip",
-            use_container_width=True,
-            type="primary",
-        )
-        st.caption(
-            "El ZIP contiene tres carpetas:\n"
-            "- **corregidos/** — notebooks listos para importar en el nuevo workspace (mismo nombre original)\n"
-            "- **originales/** — copias de respaldo con sufijo `(ORIG)`\n"
-            "- **reportes/** — detalle de cambios por notebook"
-        )
-
+    zip_bytes = generar_zip(procesados)
+    fecha = datetime.now().strftime("%Y%m%d_%H%M")
+    st.download_button(
+        label="⬇️ Descargar archivos (.zip)",
+        data=zip_bytes,
+        file_name=f"notebooks_UC_{fecha}.zip",
+        mime="application/zip",
+        use_container_width=True,
+        type="primary",
+    )
+    st.caption(
+        "El ZIP contiene tres carpetas:\n"
+        "- **corregidos/** — notebooks con el mismo nombre original, listos para importar en el nuevo workspace\n"
+        "- **originales/** — copias de respaldo con sufijo `(ORIG)`\n"
+        "- **reportes/** — detalle de cambios y flags por notebook"
+    )
     if n_revision > 0:
         st.warning(
             f"⚠️ {n_revision} notebook(s) requieren revisión manual antes de subirse al nuevo workspace. "
